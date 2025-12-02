@@ -131,39 +131,41 @@ export default function CashierPage() {
   // --- Load menu for selected vendor (only when expanded) ---
 
   useEffect(() => {
-    if (!selectedVendorId) {
-      setMenuItems([]);
-      return;
-    }
+  if (!selectedVendorId) {
+    setMenuItems([]);
+    return;
+  }
 
-    async function loadMenu() {
-      try {
-        setLoadingMenu(true);
-        setError(null);
-        const res = await fetch(
-          `/api/menu/vendor?vendorId=${encodeURIComponent(selectedVendorId)}`
-        );
-        const json = await res.json();
+  const vendorId = selectedVendorId; // narrowed to string after the guard
 
-        if (!json.success) {
-          setError(json.error ?? "Failed to load menu");
-          setMenuItems([]);
-          return;
-        }
+  async function loadMenu() {
+    try {
+      setLoadingMenu(true);
+      setError(null);
+      const res = await fetch(
+        `/api/menu/vendor?vendorId=${encodeURIComponent(vendorId)}`
+      );
+      const json = await res.json();
 
-        const items: MenuItem[] = json.items ?? json.menu ?? json.data ?? [];
-        setMenuItems(items);
-      } catch (e) {
-        console.error(e);
-        setError("Unexpected error loading menu");
+      if (!json.success) {
+        setError(json.error ?? "Failed to load menu");
         setMenuItems([]);
-      } finally {
-        setLoadingMenu(false);
+        return;
       }
-    }
 
-    loadMenu();
-  }, [selectedVendorId]);
+      const items: MenuItem[] = json.items ?? json.menu ?? json.data ?? [];
+      setMenuItems(items);
+    } catch (e) {
+      console.error(e);
+      setError("Unexpected error loading menu");
+      setMenuItems([]);
+    } finally {
+      setLoadingMenu(false);
+    }
+  }
+
+  loadMenu();
+}, [selectedVendorId]);
 
   // --- Ticket controls ---
 
