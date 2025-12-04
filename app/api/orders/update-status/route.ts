@@ -1,3 +1,4 @@
+// app/api/orders/update-status/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { updateOrderStatus } from "@/core/orders";
 
@@ -19,14 +20,26 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    if (!toStatus) {
+      return NextResponse.json(
+        { success: false, error: "toStatus is required" },
+        { status: 400 }
+      );
+    }
+
     const result = await updateOrderStatus({
       orderId,
       orderCode,
       toStatus,
       actor: actor ?? "vendor",
+      // at is optional in core; if omitted, it uses new Date()
+      // at: new Date().toISOString(),
     });
 
-    return NextResponse.json({ success: true, order: result }, { status: 200 });
+    return NextResponse.json(
+      { success: true, order: result },
+      { status: 200 }
+    );
   } catch (err: any) {
     console.error(err);
     return NextResponse.json(

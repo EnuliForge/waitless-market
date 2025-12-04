@@ -1,12 +1,10 @@
 // lib/adminDashboard.ts
 import { supabaseAdmin } from "@/lib/supabaseAdmin";
 
-const TAX_RATE = 0.16; // 16% VAT included in ticket totals
-
 export type AdminSummary = {
   ordersToday: number;
   revenueToday: number; // Kwacha
-  taxToday: number; // Kwacha portion of revenue
+  taxToday: number; // Kwacha
   activeOrders: number;
   avgPrepMinutesToday: number | null;
   vendorSalesToday: {
@@ -33,172 +31,203 @@ export type AdminSummary = {
   }[];
 };
 
-// targetDate: "YYYY-MM-DD" in local time, or undefined = today
+function todayYmd() {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
 export async function getAdminSummary(
-  targetDate?: string | null
+  date?: string
 ): Promise<AdminSummary> {
-  // === 1) Day window ===
-  let base = targetDate ? new Date(targetDate) : new Date();
-  if (isNaN(base.getTime())) {
-    // fallback to today if bad date
-    base = new Date();
-  }
-  base.setHours(0, 0, 0, 0);
+  const targetDate = date ?? todayYmd();
 
-  const start = base;
-  const end = new Date(base);
-  end.setDate(end.getDate() + 1);
+  // We’ll use created_at as the day bucket
+  const dayStart = `${targetDate}T00:00:00`;
+  const dayEnd = `${targetDate}T23:59:59.999`;
 
-  const startIso = start.toISOString();
-  const endIso = end.toISOString();
-
-  // === 2) Orders for that day only ===
-  const { data: orders, error: ordersError } = await supabaseAdmin
+  // 1) Pull all orders for that day
+  const {
+    data: orders,
+    error: ordersError,
+  } = await supabaseAdmin
     .from("orders")
-    .select("id, order_code, status, total_cents, created_at, vendor_id")
-    .gte("created_at", startIso)
-    .lt("created_at", endIso)
-    .order("created_at", { ascending: false });
+    .select(
+      `
+      id,
+      order_code,
+      status,
+      vendor_id,
+      total_cents,
+      net_cents,
+      tax_cents,
+      tax_rate,
+      created_at,
+      preparing_at,
+      ready_at,
+      collected_at,
+      vendors ( name )
+    `
+    )
+    .gte("created_at", dayStart)
+    .lte("created_at", dayEnd);
 
-  if (ordersError || !orders) {
+  if (ordersError) {
     console.error("getAdminSummary ordersError", ordersError);
-    return {
-      ordersToday: 0,
-      revenueToday: 0,
-      taxToday: 0,
-      activeOrders: 0,
-      avgPrepMinutesToday: null,
-      vendorSalesToday: [],
-      topVendor: null,
-      topItem: null,
-      latestOrders: [],
-    };
   }
 
-  const ordersToday = orders.length;
+  const safeOrders = orders ?? [];
 
-  // total_cents → Kwacha
-  const revenueToday = orders.reduce((sum, o) => {
-    const cents = (o as any).total_cents ?? 0;
-    return sum + cents / 100;
-  }, 0);
+  // 2) Basic counts/sums
+  const ordersToday = safeOrders.length;
 
-  // VAT portion (revenue is VAT-inclusive)
-  const taxToday =
-    revenueToday > 0 ? (revenueToday * TAX_RATE) / (1 + TAX_RATE) : 0;
+  let revenueCents = 0;
+  let taxCents = 0;
+  let activeOrders = 0;
 
-  const activeOrders = orders.filter((o) =>
-    ["preparing", "ready", "issue"].includes((o as any).status as string)
-  ).length;
+  // Map for vendor totals
+  const vendorTotals: Map<
+    string,
+    { vendorName: string; totalCents: number }
+  > = new Map();
 
-  // === 3) Vendor totals based on that day's orders ===
-  const vendorTotals = new Map<string, number>(); // Kwacha
-  for (const o of orders) {
-    const row = o as any;
-    const vendorId = row.vendor_id as string | null;
-    if (!vendorId) continue;
+  for (const o of safeOrders as any[]) {
+    const total_cents = o.total_cents ?? 0;
+    const tax_cents = o.tax_cents ?? 0;
+    const status = o.status as string;
+    const vendorId = o.vendor_id as string;
+    const vendorName =
+      (o.vendors && o.vendors.name) || "Unknown vendor";
 
-    const cents = row.total_cents ?? 0;
-    const kw = cents / 100;
-    vendorTotals.set(vendorId, (vendorTotals.get(vendorId) ?? 0) + kw);
-  }
+    revenueCents += total_cents;
+    taxCents += tax_cents;
 
-  let vendorSalesToday: AdminSummary["vendorSalesToday"] = [];
-  let topVendor: AdminSummary["topVendor"] = null;
-
-  const vendorIds = [...vendorTotals.keys()];
-
-  if (vendorIds.length > 0) {
-    const { data: vendors, error: vendorsError } = await supabaseAdmin
-      .from("vendors")
-      .select("id, name")
-      .in("id", vendorIds);
-
-    if (vendorsError) {
-      console.error("getAdminSummary vendorsError", vendorsError);
+    if (status === "preparing" || status === "ready") {
+      activeOrders += 1;
     }
 
-    let vendorNames = new Map<string, string>();
-    if (vendors) {
-      vendorNames = new Map(
-        vendors.map((v) => [
-          (v as any).id as string,
-          (v as any).name as string,
-        ])
-      );
-    }
-
-    vendorSalesToday = vendorIds
-      .map((vendorId) => ({
-        vendorId,
-        vendorName: vendorNames.get(vendorId) ?? vendorId,
-        total: vendorTotals.get(vendorId) ?? 0,
-      }))
-      .sort((a, b) => b.total - a.total);
-
-    if (vendorSalesToday.length > 0) {
-      topVendor = vendorSalesToday[0];
+    const existing = vendorTotals.get(vendorId);
+    if (existing) {
+      existing.totalCents += total_cents;
+    } else {
+      vendorTotals.set(vendorId, {
+        vendorName,
+        totalCents: total_cents,
+      });
     }
   }
 
-  // === 4) Most sold item for that day from order_items ===
-  const orderIds = orders.map((o) => (o as any).id as string);
-  let topItem: AdminSummary["topItem"] = null;
+  // 3) Avg prep time (minutes) using preparing_at → ready_at
+  const prepDurationsMinutes: number[] = [];
 
-  if (orderIds.length > 0) {
-    const { data: items, error: itemsError } = await supabaseAdmin
+  for (const o of safeOrders as any[]) {
+    const prep = o.preparing_at as string | null;
+    const ready = o.ready_at as string | null;
+
+    if (!prep || !ready) continue;
+
+    const prepMs = new Date(prep).getTime();
+    const readyMs = new Date(ready).getTime();
+    const diffMs = readyMs - prepMs;
+    if (!Number.isFinite(diffMs) || diffMs <= 0) continue;
+
+    const diffMinutes = diffMs / 60000;
+    prepDurationsMinutes.push(diffMinutes);
+  }
+
+  let avgPrepMinutesToday: number | null = null;
+  if (prepDurationsMinutes.length > 0) {
+    const sum = prepDurationsMinutes.reduce((a, b) => a + b, 0);
+    avgPrepMinutesToday = sum / prepDurationsMinutes.length;
+  }
+
+  // 4) Vendor sales list
+  const vendorSalesToday = Array.from(vendorTotals.entries())
+    .map(([vendorId, info]) => ({
+      vendorId,
+      vendorName: info.vendorName,
+      total: info.totalCents / 100,
+    }))
+    .sort((a, b) => b.total - a.total);
+
+  const topVendor =
+    vendorSalesToday.length > 0 ? vendorSalesToday[0] : null;
+
+  // 5) Most sold item (simple version: group by name_snapshot)
+  let topItem: { name: string; quantity: number } | null = null;
+  try {
+    const {
+      data: itemRows,
+      error: itemsError,
+    } = await supabaseAdmin
       .from("order_items")
-      .select("order_id, name_snapshot, quantity")
-      .in("order_id", orderIds);
+      .select(
+        `
+        name_snapshot,
+        quantity,
+        orders!inner (
+          created_at
+        )
+      `
+      )
+      .gte("orders.created_at", dayStart)
+      .lte("orders.created_at", dayEnd);
 
     if (itemsError) {
-      console.error("getAdminSummary itemsError (for topItem)", itemsError);
-    } else if (items && items.length > 0) {
-      const itemCounts = new Map<string, number>();
+      console.error("getAdminSummary itemsError", itemsError);
+    } else {
+      const counts: Map<string, number> = new Map();
 
-      items.forEach((row) => {
-        const name = (row as any).name_snapshot as string | null;
-        const qty = (row as any).quantity ?? 0;
-        if (!name) return;
-        itemCounts.set(name, (itemCounts.get(name) ?? 0) + qty);
-      });
+      for (const row of (itemRows ?? []) as any[]) {
+        const name = row.name_snapshot as string;
+        const qty = row.quantity ?? 0;
+        if (!name) continue;
+
+        const existing = counts.get(name) ?? 0;
+        counts.set(name, existing + qty);
+      }
 
       let bestName: string | null = null;
       let bestQty = 0;
-
-      for (const [name, qty] of itemCounts.entries()) {
+      for (const [name, qty] of counts.entries()) {
         if (qty > bestQty) {
           bestQty = qty;
           bestName = name;
         }
       }
 
-      if (bestName) {
+      if (bestName && bestQty > 0) {
         topItem = { name: bestName, quantity: bestQty };
       }
     }
+  } catch (e) {
+    console.error("getAdminSummary topItem error", e);
   }
 
-  // === 5) Avg prep time – still null until we wire events ===
-  const avgPrepMinutesToday: number | null = null;
-
-  // === 6) Latest orders (for that day) – top 12 ===
-  const latestOrders = orders.slice(0, 12).map((o) => {
-    const row = o as any;
-    return {
-      id: row.id as string,
-      code: (row.order_code as string) ?? "",
-      tableNumber: null,
-      status: row.status as string,
-      totalAmount: (row.total_cents ?? 0) / 100,
-      createdAt: row.created_at as string,
-    };
-  });
+  // 6) Latest orders (for right-hand list)
+  const latestOrders = (safeOrders as any[])
+    .slice()
+    .sort(
+      (a, b) =>
+        new Date(b.created_at).getTime() -
+        new Date(a.created_at).getTime()
+    )
+    .slice(0, 30)
+    .map((o) => ({
+      id: o.id as string,
+      code: o.order_code as string,
+      tableNumber: null as string | null, // no table schema wired yet
+      status: o.status as string,
+      totalAmount: (o.total_cents ?? 0) / 100,
+      createdAt: o.created_at as string,
+    }));
 
   return {
     ordersToday,
-    revenueToday,
-    taxToday,
+    revenueToday: revenueCents / 100,
+    taxToday: taxCents / 100,
     activeOrders,
     avgPrepMinutesToday,
     vendorSalesToday,

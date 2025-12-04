@@ -13,6 +13,7 @@ type UpdateOrderStatusInput = {
   orderCode?: string;
   toStatus: OrderStatus;
   actor: "vendor" | "cashier" | "system";
+  at?: string; // optional ISO timestamp; falls back to now()
 };
 
 interface DbMenuItem {
@@ -28,6 +29,14 @@ interface DbOrderMinimal {
   status: OrderStatus;
 }
 
+interface DbOrderStatusRow {
+  id: string;
+  status: OrderStatus;
+  preparing_at: string | null;
+  ready_at: string | null;
+  collected_at: string | null;
+}
+
 type SessionStatus = "open" | "paid" | "closed" | "cancelled";
 
 interface DbOrderSession {
@@ -37,10 +46,10 @@ interface DbOrderSession {
   created_at: string;
 }
 
-// Simple order / ticket code generator, e.g. WL-4821
-function generateSimpleCode(prefix: string = "WL"): string {
+// Simple code generator, e.g. WL-4821
+function generateSimpleOrderCode(): string {
   const random = Math.floor(1000 + Math.random() * 9000);
-  return `${prefix}-${random}`;
+  return `WL-${random}`;
 }
 
 function canTransition(from: OrderStatus, to: OrderStatus): boolean {
@@ -73,7 +82,7 @@ async function ensureSession(
   }
 
   // Create a new session with a generated ticket code
-  const ticket_code = generateSimpleCode("WL");
+  const ticket_code = generateSimpleOrderCode();
 
   const { data, error } = await supabaseAdmin
     .from("order_sessions")
@@ -184,8 +193,9 @@ export async function createOrder(
     taxRate > 0 ? Math.round(totalCents / (1 + taxRate / 100)) : totalCents;
   const taxCents = totalCents - netCents;
 
-  // 4) Generate a simple order code (per-vendor)
-  const orderCode = generateSimpleCode("MS");
+  // 4) Generate a simple order code (vendor-local)
+  const orderCode = generateSimpleOrderCode();
+  const now = new Date().toISOString();
 
   // 5) Insert into orders (linked to session)
   const { data: order, error: orderError } = await supabaseAdmin
@@ -200,8 +210,9 @@ export async function createOrder(
       tax_rate: taxRate,
       payment_method: input.paymentMethod,
       status: "preparing" as OrderStatus,
+      preparing_at: now, // ⬅️ start prep timestamp
     })
-    .select("id, order_code, vendor_id, total_cents, session_id")
+    .select("id, order_code")
     .single();
 
   if (orderError || !order) {
@@ -239,19 +250,14 @@ export async function createOrder(
     // Not fatal for the order itself; just log.
   }
 
-  // We keep the original result shape, but also add some extra fields that
-  // the API can use (vendor + totals + session & ticketCode).
+  // Note: CreatedOrderResult is likely { orderId, orderCode }.
+  // Returning extra fields (sessionId, ticketCode) is safe structurally.
   return {
     orderId: order.id,
     orderCode: order.order_code,
-    // extras (runtime-useful, TS will accept them at use sites)
-    vendorId: order.vendor_id,
-    totalCents: order.total_cents,
-    sessionId: order.session_id,
+    sessionId: session.id,
     ticketCode: session.ticket_code,
   } as CreatedOrderResult & {
-    vendorId: string;
-    totalCents: number;
     sessionId: string;
     ticketCode: string;
   };
@@ -266,23 +272,28 @@ export async function updateOrderStatus(input: UpdateOrderStatusInput) {
     throw new Error("orderId or orderCode is required.");
   }
 
-  // 1) Load current order
-  const query = supabaseAdmin.from("orders").select("id, status").limit(1);
+  const at = input.at ?? new Date().toISOString();
+
+  // 1) Load current order (with timing fields)
+  const baseQuery = supabaseAdmin
+    .from("orders")
+    .select("id, status, preparing_at, ready_at, collected_at")
+    .limit(1);
 
   const { data, error } = input.orderId
-    ? await query.eq("id", input.orderId)
-    : await query.eq("order_code", input.orderCode!);
+    ? await baseQuery.eq("id", input.orderId)
+    : await baseQuery.eq("order_code", input.orderCode!);
 
   if (error || !data || !data[0]) {
     console.error(error);
     throw new Error("Order not found.");
   }
 
-  const current = data[0] as DbOrderMinimal;
+  const current = data[0] as DbOrderStatusRow;
 
   if (current.status === input.toStatus) {
     // Nothing to do
-    return current;
+    return { id: current.id, status: current.status } as DbOrderMinimal;
   }
 
   if (!canTransition(current.status, input.toStatus)) {
@@ -291,10 +302,26 @@ export async function updateOrderStatus(input: UpdateOrderStatusInput) {
     );
   }
 
-  // 2) Update orders.status
+  // 2) Update orders.status + timestamps
+  const updates: Partial<DbOrderStatusRow> = {
+    status: input.toStatus,
+  };
+
+  if (input.toStatus === "preparing" && !current.preparing_at) {
+    updates.preparing_at = at;
+  }
+
+  if (input.toStatus === "ready" && !current.ready_at) {
+    updates.ready_at = at;
+  }
+
+  if (input.toStatus === "collected" && !current.collected_at) {
+    updates.collected_at = at;
+  }
+
   const { error: updateError } = await supabaseAdmin
     .from("orders")
-    .update({ status: input.toStatus })
+    .update(updates)
     .eq("id", current.id);
 
   if (updateError) {
@@ -320,13 +347,14 @@ export async function updateOrderStatus(input: UpdateOrderStatusInput) {
 }
 
 /**
- * Get a single order by its human order code (legacy status page / QR).
+ * Get a single order by its human order code (for legacy status page / QR).
  * Returns:
  * - order
  * - vendor name
  * - items
  *
- * NOTE: For multi-vendor tickets, prefer getSessionByTicketCode() below.
+ * NOTE: For the multi-vendor ticket flow, prefer getSessionByTicketCode()
+ * below, which returns a whole basket.
  */
 export async function getOrderByCode(orderCode: string) {
   const { data: order, error } = await supabaseAdmin
@@ -364,6 +392,8 @@ export async function getOrderByCode(orderCode: string) {
  * - session
  * - all vendor orders under it
  * - each order's vendor name + items
+ *
+ * This is what the new status page should use for consolidated receipts.
  */
 export async function getSessionByTicketCode(ticketCode: string) {
   const { data, error } = await supabaseAdmin
