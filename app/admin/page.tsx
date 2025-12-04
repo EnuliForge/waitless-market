@@ -215,6 +215,7 @@ export default function AdminPage() {
 
         {/* Top stat cards */}
         <section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          {/* Orders today */}
           <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
             <p className="text-xs uppercase tracking-wide text-slate-400">
               Orders Today
@@ -224,6 +225,7 @@ export default function AdminPage() {
             </p>
           </div>
 
+          {/* Revenue + tax in one card */}
           <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
             <p className="text-xs uppercase tracking-wide text-slate-400">
               Revenue Today (incl. VAT)
@@ -231,17 +233,25 @@ export default function AdminPage() {
             <p className="mt-2 text-3xl font-semibold">
               {formatCurrency(data.revenueToday)}
             </p>
+            <p className="mt-1 text-xs text-slate-400">
+              Tax portion:{" "}
+              <span className="font-semibold">
+                {formatCurrency(data.taxToday)}
+              </span>
+            </p>
           </div>
 
+          {/* Active orders */}
           <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
             <p className="text-xs uppercase tracking-wide text-slate-400">
-              Tax Portion Today
+              Active Orders
             </p>
             <p className="mt-2 text-3xl font-semibold">
-              {formatCurrency(data.taxToday)}
+              {data.activeOrders}
             </p>
           </div>
 
+          {/* Avg prep time */}
           <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
             <p className="text-xs uppercase tracking-wide text-slate-400">
               Avg Prep Time
