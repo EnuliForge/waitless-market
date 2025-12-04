@@ -5,7 +5,9 @@ import { getAdminSummary } from "@/lib/adminDashboard";
 export async function GET(req: NextRequest) {
   try {
     const url = new URL(req.url);
-    const date = url.searchParams.get("date"); // optional "YYYY-MM-DD"
+
+    const rawDate = url.searchParams.get("date"); // "YYYY-MM-DD" or null
+    const date = rawDate ?? undefined;            // coerce null → undefined
 
     const summary = await getAdminSummary(date);
 
@@ -13,10 +15,13 @@ export async function GET(req: NextRequest) {
       { success: true, summary },
       { status: 200 }
     );
-  } catch (err) {
+  } catch (err: any) {
     console.error("Error in /api/admin/summary:", err);
     return NextResponse.json(
-      { success: false, error: "Failed to load admin summary" },
+      {
+        success: false,
+        error: err?.message ?? "Failed to load admin summary",
+      },
       { status: 500 }
     );
   }

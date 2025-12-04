@@ -5,12 +5,17 @@ import { getAdminSummary } from "@/lib/adminDashboard";
 export async function GET(req: NextRequest) {
   try {
     const url = new URL(req.url);
-    const type = url.searchParams.get("type") ?? "summary";
-    const date = url.searchParams.get("date"); // "YYYY-MM-DD" or null
+
+    const rawDate = url.searchParams.get("date"); // "YYYY-MM-DD" or null
+    const rawType = url.searchParams.get("type"); // "summary" | "vendors" | null
+
+    const date = rawDate ?? undefined; // coerce null → undefined for getAdminSummary()
+    const type = rawType ?? "summary"; // default to "summary" if not provided
 
     const summary = await getAdminSummary(date);
-    const day = date ?? new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+    const day = rawDate ?? new Date().toISOString().slice(0, 10); // YYYY-MM-DD
 
+    // ===== SUMMARY CSV =====
     if (type === "summary") {
       const rows = [
         [
@@ -44,6 +49,7 @@ export async function GET(req: NextRequest) {
       });
     }
 
+    // ===== VENDORS CSV =====
     if (type === "vendors") {
       const rows = [
         ["date", "vendor_id", "vendor_name", "revenue_kw"],
@@ -66,6 +72,7 @@ export async function GET(req: NextRequest) {
       });
     }
 
+    // Unknown type
     return NextResponse.json(
       { success: false, error: "Unknown report type" },
       { status: 400 }
