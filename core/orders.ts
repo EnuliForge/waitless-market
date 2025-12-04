@@ -188,10 +188,14 @@ export async function createOrder(
     };
   });
 
-  const taxRate = input.taxRate ?? 0;
-  const netCents =
-    taxRate > 0 ? Math.round(totalCents / (1 + taxRate / 100)) : totalCents;
-  const taxCents = totalCents - netCents;
+  const taxRate =
+  typeof input.taxRate === "number" ? input.taxRate : 16;
+
+const netCents =
+  taxRate > 0 ? Math.round(totalCents / (1 + taxRate / 100)) : totalCents;
+
+const taxCents = totalCents - netCents;
+
 
   // 4) Generate a simple order code (vendor-local)
   const orderCode = generateSimpleOrderCode();

@@ -1,3 +1,4 @@
+// app/api/orders/create/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabaseAdmin";
 
@@ -176,15 +177,18 @@ export async function POST(req: NextRequest) {
       };
     });
 
-    const appliedTaxRate = taxRate ?? 0;
+    // 🔴 IMPORTANT PART: default taxRate → 16% if not provided
+    const appliedTaxRate =
+      typeof taxRate === "number" ? taxRate : 16;
+
     const netCents =
       appliedTaxRate > 0
         ? Math.round(totalCents / (1 + appliedTaxRate / 100))
         : totalCents;
+
     const taxCents = totalCents - netCents;
 
     // 4) Create order
-    const now = new Date().toISOString();
     const orderCode = generateSimpleCode("WL");
 
     const { data: order, error: orderError } = await supabaseAdmin
@@ -199,9 +203,8 @@ export async function POST(req: NextRequest) {
         tax_rate: appliedTaxRate,
         payment_method: paymentMethod ?? null,
         status: "preparing" as OrderStatus,
-        preparing_at: now, // ⬅️ NEW: track when prep started
       })
-      .select("id, order_code, vendor_id, total_cents, preparing_at")
+      .select("id, order_code, vendor_id, total_cents")
       .single();
 
     if (orderError || !order) {

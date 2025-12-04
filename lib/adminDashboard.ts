@@ -3,19 +3,19 @@ import { supabaseAdmin } from "@/lib/supabaseAdmin";
 
 export type AdminSummary = {
   ordersToday: number;
-  revenueToday: number; // Kwacha
-  taxToday: number; // Kwacha
+  revenueToday: number;      // kwacha
+  taxToday: number;          // kwacha
   activeOrders: number;
   avgPrepMinutesToday: number | null;
   vendorSalesToday: {
     vendorId: string;
     vendorName: string;
-    total: number; // Kwacha
+    total: number;           // kwacha
   }[];
   topVendor: {
     vendorId: string;
     vendorName: string;
-    total: number; // Kwacha
+    total: number;           // kwacha
   } | null;
   topItem: {
     name: string;
@@ -26,211 +26,227 @@ export type AdminSummary = {
     code: string;
     tableNumber: string | null;
     status: string;
-    totalAmount: number; // Kwacha
+    totalAmount: number;     // kwacha
     createdAt: string;
   }[];
 };
 
-function todayYmd() {
-  const d = new Date();
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
+const DEFAULT_VAT_RATE = 16; // 16% VAT included in totals
+
+function getDayBounds(date?: string): { start: string; end: string } {
+  if (date) {
+    const start = `${date}T00:00:00`;
+    const end = `${date}T23:59:59.999`;
+    return { start, end };
+  }
+
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, "0");
+  const d = String(now.getDate()).padStart(2, "0");
+  const isoDate = `${y}-${m}-${d}`;
+  return {
+    start: `${isoDate}T00:00:00`,
+    end: `${isoDate}T23:59:59.999`,
+  };
 }
 
-export async function getAdminSummary(
-  date?: string
-): Promise<AdminSummary> {
-  const targetDate = date ?? todayYmd();
+export async function getAdminSummary(date?: string): Promise<AdminSummary> {
+  const { start, end } = getDayBounds(date);
 
-  // We’ll use created_at as the day bucket
-  const dayStart = `${targetDate}T00:00:00`;
-  const dayEnd = `${targetDate}T23:59:59.999`;
-
-  // 1) Pull all orders for that day
-  const {
-    data: orders,
-    error: ordersError,
-  } = await supabaseAdmin
+  // 1) Load all orders created on this day
+  const { data: orders, error: ordersError } = await supabaseAdmin
     .from("orders")
     .select(
       `
       id,
       order_code,
-      status,
       vendor_id,
       total_cents,
-      net_cents,
       tax_cents,
       tax_rate,
+      status,
       created_at,
-      preparing_at,
-      ready_at,
-      collected_at,
-      vendors ( name )
+      ready_at
     `
     )
-    .gte("created_at", dayStart)
-    .lte("created_at", dayEnd);
+    .gte("created_at", start)
+    .lte("created_at", end)
+    .order("created_at", { ascending: false });
 
   if (ordersError) {
     console.error("getAdminSummary ordersError", ordersError);
+    throw new Error("Failed to load orders for admin summary.");
   }
 
   const safeOrders = orders ?? [];
 
-  // 2) Basic counts/sums
-  const ordersToday = safeOrders.length;
+  // 2) Vendor names for those vendors
+  const vendorIds = Array.from(
+    new Set(safeOrders.map((o) => o.vendor_id).filter(Boolean))
+  ) as string[];
 
-  let revenueCents = 0;
-  let taxCents = 0;
+  let vendorNameById = new Map<string, string>();
+
+  if (vendorIds.length > 0) {
+    const { data: vendors, error: vendorsError } = await supabaseAdmin
+      .from("vendors")
+      .select("id, name")
+      .in("id", vendorIds);
+
+    if (vendorsError) {
+      console.error("getAdminSummary vendorsError", vendorsError);
+    } else {
+      vendorNameById = new Map(
+        (vendors ?? []).map((v: any) => [v.id as string, v.name as string])
+      );
+    }
+  }
+
+  // 3) Revenue, "tax from DB" (if any), active orders, prep durations
+  let totalCents = 0;
+  let taxCentsFromDb = 0;
+  let anyNonZeroTax = false;
   let activeOrders = 0;
+  const prepDurationsMinutes: number[] = [];
 
-  // Map for vendor totals
-  const vendorTotals: Map<
-    string,
-    { vendorName: string; totalCents: number }
-  > = new Map();
+  for (const o of safeOrders) {
+    const t = o.total_cents ?? 0;
+    const tax = o.tax_cents ?? 0;
 
-  for (const o of safeOrders as any[]) {
-    const total_cents = o.total_cents ?? 0;
-    const tax_cents = o.tax_cents ?? 0;
-    const status = o.status as string;
-    const vendorId = o.vendor_id as string;
-    const vendorName =
-      (o.vendors && o.vendors.name) || "Unknown vendor";
+    totalCents += t;
+    taxCentsFromDb += tax;
+    if (tax > 0) anyNonZeroTax = true;
 
-    revenueCents += total_cents;
-    taxCents += tax_cents;
-
-    if (status === "preparing" || status === "ready") {
+    if (o.status !== "collected") {
       activeOrders += 1;
     }
 
-    const existing = vendorTotals.get(vendorId);
+    if (o.created_at && o.ready_at) {
+      const created = new Date(o.created_at).getTime();
+      const ready = new Date(o.ready_at).getTime();
+      if (ready > created) {
+        const diffMinutes = (ready - created) / (1000 * 60);
+        prepDurationsMinutes.push(diffMinutes);
+      }
+    }
+  }
+
+  const ordersToday = safeOrders.length;
+  const revenueToday = totalCents / 100;
+
+  // If the DB actually has non-zero tax_cents, trust it.
+  // Otherwise, compute tax as the 16% VAT portion of revenueToday.
+  let taxToday: number;
+  if (anyNonZeroTax && taxCentsFromDb > 0) {
+    taxToday = taxCentsFromDb / 100;
+  } else {
+    const divisor = 1 + DEFAULT_VAT_RATE / 100; // 1.16
+    const net = revenueToday / divisor;
+    taxToday = revenueToday - net;
+  }
+
+  const avgPrepMinutesToday =
+    prepDurationsMinutes.length > 0
+      ? prepDurationsMinutes.reduce((a, b) => a + b, 0) /
+        prepDurationsMinutes.length
+      : null;
+
+  // 4) Vendor sales aggregates (kwacha)
+  const vendorSalesMap = new Map<
+    string,
+    { vendorId: string; vendorName: string; totalKw: number }
+  >();
+
+  for (const o of safeOrders) {
+    const vid = o.vendor_id as string | null;
+    if (!vid) continue;
+
+    const existing = vendorSalesMap.get(vid);
+    const name = vendorNameById.get(vid) ?? "Unknown vendor";
+    const incKw = (o.total_cents ?? 0) / 100;
+
     if (existing) {
-      existing.totalCents += total_cents;
+      existing.totalKw += incKw;
     } else {
-      vendorTotals.set(vendorId, {
-        vendorName,
-        totalCents: total_cents,
+      vendorSalesMap.set(vid, {
+        vendorId: vid,
+        vendorName: name,
+        totalKw: incKw,
       });
     }
   }
 
-  // 3) Avg prep time (minutes) using preparing_at → ready_at
-  const prepDurationsMinutes: number[] = [];
-
-  for (const o of safeOrders as any[]) {
-    const prep = o.preparing_at as string | null;
-    const ready = o.ready_at as string | null;
-
-    if (!prep || !ready) continue;
-
-    const prepMs = new Date(prep).getTime();
-    const readyMs = new Date(ready).getTime();
-    const diffMs = readyMs - prepMs;
-    if (!Number.isFinite(diffMs) || diffMs <= 0) continue;
-
-    const diffMinutes = diffMs / 60000;
-    prepDurationsMinutes.push(diffMinutes);
-  }
-
-  let avgPrepMinutesToday: number | null = null;
-  if (prepDurationsMinutes.length > 0) {
-    const sum = prepDurationsMinutes.reduce((a, b) => a + b, 0);
-    avgPrepMinutesToday = sum / prepDurationsMinutes.length;
-  }
-
-  // 4) Vendor sales list
-  const vendorSalesToday = Array.from(vendorTotals.entries())
-    .map(([vendorId, info]) => ({
-      vendorId,
-      vendorName: info.vendorName,
-      total: info.totalCents / 100,
-    }))
-    .sort((a, b) => b.total - a.total);
+  const vendorSalesToday = Array.from(vendorSalesMap.values()).sort(
+    (a, b) => b.totalKw - a.totalKw
+  );
 
   const topVendor =
-    vendorSalesToday.length > 0 ? vendorSalesToday[0] : null;
+    vendorSalesToday.length > 0
+      ? {
+          vendorId: vendorSalesToday[0].vendorId,
+          vendorName: vendorSalesToday[0].vendorName,
+          total: vendorSalesToday[0].totalKw,
+        }
+      : null;
 
-  // 5) Most sold item (simple version: group by name_snapshot)
+  // 5) Top item by quantity
   let topItem: { name: string; quantity: number } | null = null;
-  try {
-    const {
-      data: itemRows,
-      error: itemsError,
-    } = await supabaseAdmin
+  const orderIds = safeOrders.map((o) => o.id);
+  if (orderIds.length > 0) {
+    const { data: items, error: itemsError } = await supabaseAdmin
       .from("order_items")
-      .select(
-        `
-        name_snapshot,
-        quantity,
-        orders!inner (
-          created_at
-        )
-      `
-      )
-      .gte("orders.created_at", dayStart)
-      .lte("orders.created_at", dayEnd);
+      .select("order_id, name_snapshot, quantity")
+      .in("order_id", orderIds);
 
     if (itemsError) {
       console.error("getAdminSummary itemsError", itemsError);
     } else {
-      const counts: Map<string, number> = new Map();
+      const itemTotals = new Map<string, number>();
 
-      for (const row of (itemRows ?? []) as any[]) {
-        const name = row.name_snapshot as string;
-        const qty = row.quantity ?? 0;
-        if (!name) continue;
-
-        const existing = counts.get(name) ?? 0;
-        counts.set(name, existing + qty);
+      for (const it of items ?? []) {
+        const name = it.name_snapshot || "Unknown item";
+        const qty = it.quantity ?? 0;
+        itemTotals.set(name, (itemTotals.get(name) ?? 0) + qty);
       }
 
       let bestName: string | null = null;
       let bestQty = 0;
-      for (const [name, qty] of counts.entries()) {
+
+      for (const [name, qty] of itemTotals.entries()) {
         if (qty > bestQty) {
           bestQty = qty;
           bestName = name;
         }
       }
 
-      if (bestName && bestQty > 0) {
+      if (bestName) {
         topItem = { name: bestName, quantity: bestQty };
       }
     }
-  } catch (e) {
-    console.error("getAdminSummary topItem error", e);
   }
 
-  // 6) Latest orders (for right-hand list)
-  const latestOrders = (safeOrders as any[])
-    .slice()
-    .sort(
-      (a, b) =>
-        new Date(b.created_at).getTime() -
-        new Date(a.created_at).getTime()
-    )
-    .slice(0, 30)
-    .map((o) => ({
-      id: o.id as string,
-      code: o.order_code as string,
-      tableNumber: null as string | null, // no table schema wired yet
-      status: o.status as string,
-      totalAmount: (o.total_cents ?? 0) / 100,
-      createdAt: o.created_at as string,
-    }));
+  // 6) Latest orders list
+  const latestOrders = safeOrders.slice(0, 40).map((o: any) => ({
+    id: o.id as string,
+    code: o.order_code as string,
+    tableNumber: null as string | null, // no table_number in schema now
+    status: o.status as string,
+    totalAmount: (o.total_cents ?? 0) / 100,
+    createdAt: o.created_at as string,
+  }));
 
   return {
     ordersToday,
-    revenueToday: revenueCents / 100,
-    taxToday: taxCents / 100,
+    revenueToday,
+    taxToday,
     activeOrders,
     avgPrepMinutesToday,
-    vendorSalesToday,
+    vendorSalesToday: vendorSalesToday.map((v) => ({
+      vendorId: v.vendorId,
+      vendorName: v.vendorName,
+      total: v.totalKw,
+    })),
     topVendor,
     topItem,
     latestOrders,
